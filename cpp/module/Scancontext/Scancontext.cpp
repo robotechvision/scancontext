@@ -165,7 +165,7 @@ MatrixXd SCManager::makeScancontext( pcl::PointCloud<SCPointType> & _scan_down )
     {
         pt.x = _scan_down.points[pt_idx].x; 
         pt.y = _scan_down.points[pt_idx].y;
-        pt.z = _scan_down.points[pt_idx].z + LIDAR_HEIGHT; // naive adding is ok (all points should be > 0).
+        pt.z = USE_INTENSITY ? _scan_down.points[pt_idx].intensity : _scan_down.points[pt_idx].z + LIDAR_HEIGHT; // naive adding is ok (all points should be > 0).
 
         // xyz to ring, sector
         azim_range = sqrt(pt.x * pt.x + pt.y * pt.y);

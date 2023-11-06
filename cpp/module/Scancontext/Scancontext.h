@@ -95,6 +95,8 @@ public:
     int    TREE_MAKING_PERIOD_ = 50; // i.e., remaking tree frequency, to avoid non-mandatory every remaking, to save time cost / if you want to find a very recent revisits use small value of it (it is enough fast ~ 5-50ms wrt N.).
     int          tree_making_period_conter = 0;
 
+    bool USE_INTENSITY = false;
+
     // data 
     std::vector<double> polarcontexts_timestamp_; // optional.
     std::vector<Eigen::MatrixXd> polarcontexts_;
