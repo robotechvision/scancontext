@@ -70,7 +70,7 @@ public:
 
     // User-side API
     void makeAndSaveScancontextAndKeys( pcl::PointCloud<SCPointType> & _scan_down );
-    std::pair<int, float> detectLoopClosureID( void ); // int: nearest node index, float: relative yaw  
+    std::vector<std::pair<int, float>> detectLoopClosureID( void ); // int: nearest node index, float: relative yaw
 
 public:
     // hyper parameters ()
@@ -90,6 +90,8 @@ public:
     double SEARCH_RATIO = 0.1; // for fast comparison, no Brute-force, but search 10 % is okay. // not was in the original conf paper, but improved ver.
     double SC_DIST_THRES = 0.13; // empirically 0.1-0.2 is fine (rare false-alarms) for 20x60 polar context (but for 0.15 <, DCS or ICP fit score check (e.g., in LeGO-LOAM) should be required for robustness)
     // const double SC_DIST_THRES = 0.5; // 0.4-0.6 is good choice for using with robust kernel (e.g., Cauchy, DCS) + icp fitness threshold / if not, recommend 0.1-0.15
+    double SC_MIN_CONFIDENCE = 0.65;  // how much better must be the best match from the second best (second_best/(best+second_best))
+    double SC_CONFIDENCE_CHECK_SPATIAL_DIST = 4.0;  // scans that are too close to the best match scan are ignored in the confidence check
 
     // config 
     int    TREE_MAKING_PERIOD_ = 50; // i.e., remaking tree frequency, to avoid non-mandatory every remaking, to save time cost / if you want to find a very recent revisits use small value of it (it is enough fast ~ 5-50ms wrt N.).
@@ -102,6 +104,7 @@ public:
     std::vector<Eigen::MatrixXd> polarcontexts_;
     std::vector<Eigen::MatrixXd> polarcontext_invkeys_;
     std::vector<Eigen::MatrixXd> polarcontext_vkeys_;
+    std::function<double(int, int)> spatial_distance_between_scancontexts_ = [](int, int){return std::numeric_limits<double>::infinity();};
 
     KeyMat polarcontext_invkeys_mat_;
     KeyMat polarcontext_invkeys_to_search_;

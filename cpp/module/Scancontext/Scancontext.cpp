@@ -244,7 +244,7 @@ void SCManager::makeAndSaveScancontextAndKeys( pcl::PointCloud<SCPointType> & _s
 } // SCManager::makeAndSaveScancontextAndKeys
 
 
-std::pair<int, float> SCManager::detectLoopClosureID ( void )
+std::vector<std::pair<int, float>> SCManager::detectLoopClosureID ( void )
 {
     int loop_id { -1 }; // init with -1, -1 means no loop (== LeGO-LOAM's variable "closestHistoryFrameID")
 
@@ -256,17 +256,23 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
      */
     if( polarcontext_invkeys_mat_.size() < NUM_EXCLUDE_RECENT + 1)
     {
-        std::pair<int, float> result {loop_id, 0.0};
-        return result; // Early return 
+        return {std::pair<int, float>{loop_id, 0.0}};  // not enough scancontexts yet
     }
 
+    size_t first_check_only_candidate_index = polarcontext_invkeys_mat_.size() - NUM_EXCLUDE_RECENT;
     // tree_ reconstruction (not mandatory to make everytime)
     if( tree_making_period_conter % TREE_MAKING_PERIOD_ == 0) // to save computation cost
     {
         TicToc t_tree_construction;
 
         polarcontext_invkeys_to_search_.clear();
+        polarcontext_invkeys_to_search_.reserve(polarcontext_invkeys_mat_.size());
         polarcontext_invkeys_to_search_.assign( polarcontext_invkeys_mat_.begin(), polarcontext_invkeys_mat_.end() - NUM_EXCLUDE_RECENT ) ;
+        // add also scancontexts which are far enough from the current observation (for confidence check)
+        if (spatial_distance_between_scancontexts_)
+            for (size_t i = first_check_only_candidate_index; i < polarcontext_invkeys_mat_.size(); i++)
+                if (spatial_distance_between_scancontexts_(i, polarcontext_invkeys_mat_.size() - 1) > SC_CONFIDENCE_CHECK_SPATIAL_DIST)
+                    polarcontext_invkeys_to_search_.push_back(polarcontext_invkeys_mat_[i]);
 
         polarcontext_tree_.reset(); 
         polarcontext_tree_ = std::make_unique<InvKeyTree>(PC_NUM_RING /* dim */, polarcontext_invkeys_to_search_, 10 /* max leaf */ );
@@ -279,12 +285,14 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
     int nn_align = 0;
     int nn_idx = 0;
 
+    // add a reserve for candidates used only for confidence check
+    int num_candidates_from_tree = NUM_CANDIDATES_FROM_TREE + polarcontext_invkeys_to_search_.size() - first_check_only_candidate_index;
     // knn search
-    std::vector<size_t> candidate_indexes( NUM_CANDIDATES_FROM_TREE ); 
-    std::vector<float> out_dists_sqr( NUM_CANDIDATES_FROM_TREE );
+    std::vector<size_t> candidate_indexes( num_candidates_from_tree );
+    std::vector<float> out_dists_sqr( num_candidates_from_tree );
 
     TicToc t_tree_search;
-    nanoflann::KNNResultSet<float> knnsearch_result( NUM_CANDIDATES_FROM_TREE );
+    nanoflann::KNNResultSet<float> knnsearch_result( num_candidates_from_tree );
     knnsearch_result.init( &candidate_indexes[0], &out_dists_sqr[0] );
     polarcontext_tree_->index->findNeighbors( knnsearch_result, &curr_key[0] /* query */, nanoflann::SearchParams(10) ); 
     t_tree_search.toc("Tree search");
@@ -292,14 +300,20 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
     /* 
      *  step 2: pairwise distance (find optimal columnwise best-fit using cosine distance)
      */
+    std::vector<std::pair<double, int>> candidate_dists( num_candidates_from_tree );
     TicToc t_calc_dist;   
-    for ( int candidate_iter_idx = 0; candidate_iter_idx < NUM_CANDIDATES_FROM_TREE; candidate_iter_idx++ )
+    for ( int candidate_iter_idx = 0; candidate_iter_idx < num_candidates_from_tree; candidate_iter_idx++ )
     {
         MatrixXd polarcontext_candidate = polarcontexts_[ candidate_indexes[candidate_iter_idx] ];
         std::pair<double, int> sc_dist_result = distanceBtnScanContext( curr_desc, polarcontext_candidate ); 
         
         double candidate_dist = sc_dist_result.first;
         int candidate_align = sc_dist_result.second;
+        candidate_dists[candidate_iter_idx] = sc_dist_result;
+
+        if (candidate_indexes[candidate_iter_idx] >= first_check_only_candidate_index) {
+            continue; // skip those for confidence check only
+        }
 
         if( candidate_dist < min_dist )
         {
@@ -311,6 +325,44 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
     }
     t_calc_dist.toc("Distance calc");
 
+    /*
+     * step 3: loop decision (including confidence check)
+     */
+    // confidence check
+    double second_min_dist = 1e7;
+    int second_nn_idx = -1;
+    int second_nn_align = 0;
+    for ( int candidate_iter_idx = 0; candidate_iter_idx < num_candidates_from_tree; candidate_iter_idx++ ) {
+        std::pair<double, int> dist;
+        if (candidate_indexes[candidate_iter_idx] == nn_idx) {
+            // for best match scan check if rotation by 180 degrees has different enough score (to avoid
+            MatrixXd polarcontext_candidate = polarcontexts_[nn_idx];
+            int align = (nn_align + (int)round(curr_desc.cols()/2.0)) % curr_desc.cols();
+            auto sc2_shifted = circshift(polarcontext_candidate, align);
+            dist = std::pair<double, int>(distDirectSC( curr_desc, sc2_shifted ), align);
+        }
+        else {
+            if (spatial_distance_between_scancontexts_(candidate_indexes[candidate_iter_idx], nn_idx) < SC_CONFIDENCE_CHECK_SPATIAL_DIST)
+                continue; // skip those too close to the best match scan
+            dist = candidate_dists[candidate_iter_idx];
+        }
+
+        if (dist.first < second_min_dist) {
+            second_min_dist = dist.first;
+            second_nn_align = dist.second;
+            second_nn_idx = candidate_indexes[candidate_iter_idx];
+        }
+    }
+    double confidence = second_min_dist/(min_dist + second_min_dist + 1e-6);  // to avoid zero-division
+    if (second_nn_idx == -1 || confidence < SC_MIN_CONFIDENCE) {
+        std::cout.precision(3);
+        cout << "[Not loop] Confidence check failed. Nearest distance: " << min_dist << " (" << nn_idx << "/" << polarcontexts_.size()-1 << ", " << nn_align * PC_UNIT_SECTORANGLE <<
+              "), second nearest distance: " << second_min_dist << " (" << second_nn_idx << ", " << second_nn_align * PC_UNIT_SECTORANGLE <<
+                 "). Confidence: " << confidence << "/" << SC_MIN_CONFIDENCE << endl;
+
+        return {std::pair<int, float>{ -1, 0.0 }};
+    }
+
     /* 
      * loop threshold check
      */
@@ -320,20 +372,19 @@ std::pair<int, float> SCManager::detectLoopClosureID ( void )
     
         // std::cout.precision(3); 
         cout << "[Loop found] Nearest distance: " << min_dist << " btn " << polarcontexts_.size()-1 << " and " << nn_idx << "." << endl;
-        cout << "[Loop found] yaw diff: " << nn_align * PC_UNIT_SECTORANGLE << " deg." << endl;
+        cout << "[Loop found] Second nearest distance: " << second_min_dist << " btn " << polarcontexts_.size()-1 << " and " << second_nn_idx << ". Confidence: " << confidence << "/" << SC_MIN_CONFIDENCE << endl;
+        cout << "[Loop found] yaw diff: " << nn_align * PC_UNIT_SECTORANGLE << " deg. (second: " << second_nn_align * PC_UNIT_SECTORANGLE << ")" << endl;
     }
     else
     {
         std::cout.precision(3); 
         cout << "[Not loop] Nearest distance: " << min_dist << " btn " << polarcontexts_.size()-1 << " and " << nn_idx << "." << endl;
-        cout << "[Not loop] yaw diff: " << nn_align * PC_UNIT_SECTORANGLE << " deg." << endl;
+        cout << "[Not loop] Second nearest distance: " << second_min_dist << " btn " << polarcontexts_.size()-1 << " and " << second_nn_idx << ". Confidence: " << confidence << "/" << SC_MIN_CONFIDENCE << endl;
+        cout << "[Not loop] yaw diff: " << nn_align * PC_UNIT_SECTORANGLE << " deg. (second: " << second_nn_align * PC_UNIT_SECTORANGLE << ")" << endl;
     }
 
-    // To do: return also nn_align (i.e., yaw diff)
-    float yaw_diff_rad = deg2rad(nn_align * PC_UNIT_SECTORANGLE);
-    std::pair<int, float> result {loop_id, yaw_diff_rad};
-
-    return result;
+    return {std::pair<int, float>{loop_id, deg2rad(nn_align * PC_UNIT_SECTORANGLE)},
+               std::pair<int, float>{second_nn_idx, deg2rad(second_nn_align * PC_UNIT_SECTORANGLE)}};
 
 } // SCManager::detectLoopClosureID
 
